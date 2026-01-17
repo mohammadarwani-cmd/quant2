@@ -38,7 +38,7 @@ PRESET_CONCEPTS = [
     "算力概念", "CPO概念", "人工智能", "半导体", 
     "量子科技", "6G概念", "固态电池", "数据要素",
     "车路云", "人形机器人", "信创", "创新药",
-    "核污染防治", "超导概念", "冷液服务器" # 增加一些高波动概念测试ER指标
+    "核污染防治", "超导概念", "冷液服务器"
 ]
 DEFAULT_SATELLITE_CONCEPTS = ["机器人概念", "商业航天概念", "脑机接口", "低空经济", "算力概念"]
 
@@ -47,7 +47,7 @@ DEFAULT_PARAMS = {
     'core_codes': DEFAULT_CORE_CODES,
     'core_lookback': 25, 'core_smooth': 3, 'core_top_n': 1, 'core_allow_cash': True, 'core_score_mode': '纯收益 (Return)',
     'sat_concepts': DEFAULT_SATELLITE_CONCEPTS,
-    'sat_lookback': 15, 'sat_smooth': 1, 'sat_top_n': 2, 'sat_allow_cash': False, 'sat_score_mode': '趋势质量 (Efficiency Ratio)' # 卫星默认改用ER
+    'sat_lookback': 5, 'sat_smooth': 1, 'sat_top_n': 2, 'sat_allow_cash': False, 'sat_score_mode': '量价爆发 (PV Breakout)' # 卫星默认激进模式
 }
 
 TRANSACTION_COST = 0.0001 
@@ -84,7 +84,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 健壮数据层 (修复回测时间问题)
+# 2. 健壮数据层 (支持成交量 Volume)
 # ==========================================
 @st.cache_data(ttl=3600*12) 
 def get_etf_list():
@@ -93,9 +93,9 @@ def get_etf_list():
 
 @st.cache_data(ttl=3600*4)
 def download_etf_data(codes, end_date_str):
-    # 修复：将起始时间前移，允许更长的回测
     start_str = '20150101' 
     price_dict = {}
+    vol_dict = {} # 新增
     name_map = {}
     etf_list = get_etf_list()
     
@@ -112,21 +112,34 @@ def download_etf_data(codes, end_date_str):
             if not df.empty:
                 df.index = pd.to_datetime(df['日期'])
                 price_dict[name] = df['收盘'].astype(float)
+                # ETF数据通常也有成交量，尝试获取
+                if '成交量' in df.columns:
+                    vol_dict[name] = df['成交量'].astype(float)
+                else:
+                    vol_dict[name] = pd.Series(1, index=df.index) # 填充1防止报错
         except: continue
 
-    if not price_dict: return None, None
+    if not price_dict: return None, None, None
     data = pd.concat(price_dict, axis=1).sort_index().ffill()
     data.dropna(how='all', inplace=True)
-    return (data, name_map) if len(data) >= 20 else (None, None)
+    
+    # Volume对齐
+    if vol_dict:
+        vol_data = pd.concat(vol_dict, axis=1).sort_index().ffill()
+        vol_data = vol_data.reindex(data.index).fillna(0)
+    else:
+        vol_data = pd.DataFrame(1, index=data.index, columns=data.columns)
+
+    return data, vol_data, name_map
 
 @st.cache_data(ttl=3600*4)
 def download_concept_data(concepts, end_date_str):
-    # 修复：将起始时间前移
     start_str = '20150101'
     price_dict = {}
+    vol_dict = {} # 新增
     name_map = {}
     
-    progress_bar = st.progress(0, text="启动卫星雷达，扫描行业数据...")
+    progress_bar = st.progress(0, text="启动卫星雷达，扫描行业量价数据...")
     total = len(concepts)
     
     for i, concept_name in enumerate(concepts):
@@ -135,6 +148,7 @@ def download_concept_data(concepts, end_date_str):
             if not df.empty:
                 df.index = pd.to_datetime(df['日期'])
                 price_dict[concept_name] = df['收盘'].astype(float)
+                vol_dict[concept_name] = df['成交量'].astype(float) # 获取成交量
                 name_map[concept_name] = concept_name
         except Exception:
             pass
@@ -143,41 +157,70 @@ def download_concept_data(concepts, end_date_str):
             
     progress_bar.empty()
 
-    if not price_dict: return None, None
+    if not price_dict: return None, None, None
     data = pd.concat(price_dict, axis=1).sort_index().ffill()
+    
+    # Volume对齐
+    if vol_dict:
+        vol_data = pd.concat(vol_dict, axis=1).sort_index().ffill()
+        vol_data = vol_data.reindex(data.index).fillna(0)
+    else:
+        vol_data = pd.DataFrame(1, index=data.index, columns=data.columns)
+
     cols_to_drop = [c for c in data.columns if data[c].count() < 20]
-    if cols_to_drop: data.drop(columns=cols_to_drop, inplace=True)
+    if cols_to_drop: 
+        data.drop(columns=cols_to_drop, inplace=True)
+        vol_data.drop(columns=cols_to_drop, inplace=True)
         
-    return data, name_map
+    return data, vol_data, name_map
 
 # ==========================================
-# 3. 策略引擎 (新增 ER 指标)
+# 3. 策略引擎 (新增量价爆发模式)
 # ==========================================
-def calculate_score(data, lookback, smooth, mode):
-    # 1. 基础动量 (ROC)
+def calculate_score(data, vol_data, lookback, smooth, mode):
+    """
+    计算得分
+    """
+    # 1. 基础动量
     momentum = data.pct_change(lookback)
     
     if mode == '风险调整 (Risk-Adjusted)':
-        # Sharpe型: 收益 / 波动
-        vol = data.pct_change().rolling(lookback).std() * np.sqrt(lookback)
-        score = momentum / (vol + 0.0001)
+        volatility = data.pct_change().rolling(lookback).std() * np.sqrt(lookback)
+        score = momentum / (volatility + 0.0001)
         
     elif mode == '趋势质量 (Efficiency Ratio)':
-        # Kaufman效率比型: 净涨幅 / 路径总长度
-        # 路径总长度 = sum(abs(daily_return)) over lookback
-        # ER 越高，说明噪音越小，趋势越纯粹
         daily_abs_change = data.diff().abs()
         path_length = daily_abs_change.rolling(lookback).sum()
-        net_change = data.diff(lookback).abs() # 这里取绝对值计算ER系数，方向由momentum决定
-        
+        net_change = data.diff(lookback).abs()
         er = net_change / (path_length + 0.0001)
-        
-        # 最终得分 = 动量 * ER系数
-        # 这样既看涨幅，也看涨得顺不顺
         score = momentum * er
         
+    elif mode == '量价爆发 (PV Breakout)':
+        # === 游资模式核心逻辑 ===
+        # 1. 价格爆发：看短周期涨幅
+        # 2. 资金进场：看成交量是否放大 (当前量 / 20日均量)
+        # 3. 均线生命线：价格跌破 MA20 强制出局
+        
+        # 量比因子
+        ma_vol_20 = vol_data.rolling(20).mean()
+        vol_ratio = vol_data / (ma_vol_20 + 1.0) # 加1防除零
+        
+        # 限制量比最大影响，防止噪音
+        vol_factor = vol_ratio.clip(upper=3.0) 
+        
+        # 核心公式：得分 = 动量 * (0.5 + 0.5 * 量比)
+        # 意义：如果有量，得分会放大；如果缩量，得分会打折
+        score = momentum * (0.5 + 0.5 * vol_factor)
+        
+        # === 熔断机制：MA20 ===
+        ma_20 = data.rolling(20).mean()
+        # 创建掩码：收盘价 < MA20 的位置
+        mask_below_ma = data < ma_20
+        
+        # 将破位的得分强制设为负无穷 (强制卖出)
+        score[mask_below_ma] = -np.inf
+        
     else:
-        # 纯收益
         score = momentum
         
     if smooth > 1: 
@@ -185,16 +228,18 @@ def calculate_score(data, lookback, smooth, mode):
         
     return score
 
-def run_strategy(data, params):
+def run_strategy(data, vol_data, params):
     lookback = params['lookback']
     smooth = params['smooth']
     threshold = 0.005 
     top_n = params['top_n']
-    mode = params['score_mode'] # 修复：正确传递 mode
+    mode = params['score_mode']
     allow_cash = params['allow_cash']
     
     daily_ret = data.pct_change().fillna(0)
-    score_df = calculate_score(data, lookback, smooth, mode)
+    
+    # 传入 vol_data 计算得分
+    score_df = calculate_score(data, vol_data, lookback, smooth, mode)
     
     p_score = score_df.shift(1).values
     p_ret = daily_ret.values
@@ -213,20 +258,22 @@ def run_strategy(data, params):
             holdings_hist.append([-1]*top_n)
             continue
         
-        # 避险
+        # 避险检查
         if allow_cash:
             for k in range(top_n):
                 if current_holdings[k] != -1:
                     s = clean_score[current_holdings[k]]
+                    # 只要得分<0 或 为-inf(破均线) 就卖出
                     if s < 0 or s == -np.inf: current_holdings[k] = -1
         
-        # 候选
+        # 候选池
         curr_set = set(current_holdings)
         candidates = []
         for idx in np.argsort(clean_score)[::-1]:
             if idx not in curr_set:
                 if clean_score[idx] == -np.inf: continue 
-                if (not allow_cash) or (clean_score[idx] > 0):
+                # 只有得分>0 (正动量) 才考虑买入卫星
+                if clean_score[idx] > 0: 
                     candidates.append(idx)
         
         # 换仓
@@ -288,27 +335,20 @@ def main():
     
     with st.sidebar:
         st.title("🛰️ 核心-卫星策略台")
-        
-        # 1. 顶层配置
         st.markdown("### 1. 顶层资产配置")
         core_weight = st.slider("核心策略权重", 0.0, 1.0, st.session_state.params.get('invest_ratio', 0.8), 0.1)
         
         st.divider()
-        
-        # 2. 回测区间 (修复：确保此处设置生效)
         st.markdown("### 2. 回测时间机 (Time Machine)")
         date_mode = st.radio("时间模式", ["全历史 (Max)", "自定义 (Custom)"], horizontal=True)
-        start_d = datetime(2016,1,1) # 默认起点
+        start_d = datetime(2016,1,1) 
         end_d = datetime.now()
-        
         if date_mode == "自定义 (Custom)":
             c1, c2 = st.columns(2)
             start_d = datetime.combine(c1.date_input("开始", datetime(2020,1,1)), datetime.min.time())
             end_d = datetime.combine(c2.date_input("结束", datetime.now()), datetime.min.time())
         
         st.divider()
-        
-        # 3. 策略详情
         tab_core, tab_sat = st.tabs(["🔵 核心 (ETF)", "🔴 卫星 (概念)"])
         
         with tab_core:
@@ -317,8 +357,6 @@ def main():
             curr_core = st.session_state.params.get('core_codes', DEFAULT_CORE_CODES)
             sel_core_disp = st.multiselect("核心池", pre_opts, default=[x for x in pre_opts if x.split(" | ")[0] in curr_core])
             sel_core_codes = [x.split(" | ")[0] for x in sel_core_disp]
-            
-            # 核心参数
             c_mode = st.selectbox("核心算法", ["纯收益 (Return)", "风险调整 (Risk-Adjusted)", "趋势质量 (Efficiency Ratio)"], index=0, key='c_mode')
             c_lookback = st.slider("核心-周期", 5, 60, st.session_state.params.get('core_lookback', 25))
             c_smooth = st.slider("核心-平滑", 1, 10, st.session_state.params.get('core_smooth', 3))
@@ -329,16 +367,14 @@ def main():
             curr_sat = st.session_state.params.get('sat_concepts', DEFAULT_SATELLITE_CONCEPTS)
             sel_sat_concepts = st.multiselect("卫星池", PRESET_CONCEPTS, default=curr_sat)
             
-            st.info("💡 建议：卫星策略使用【趋势质量】指标，可有效过滤板块噪音。")
-            # 卫星参数 (默认推荐ER指标)
-            s_mode_default_idx = 2 # 默认选第3个: 趋势质量
-            if 'sat_score_mode' in st.session_state.params:
-                modes = ["纯收益 (Return)", "风险调整 (Risk-Adjusted)", "趋势质量 (Efficiency Ratio)"]
-                if st.session_state.params['sat_score_mode'] in modes:
-                    s_mode_default_idx = modes.index(st.session_state.params['sat_score_mode'])
+            st.info("🔥 卫星新算法：【量价爆发】。结合涨幅与成交量，且破位20日线强制止损。")
+            s_mode_idx = 3 # 默认选PV Breakout
+            s_modes_list = ["纯收益 (Return)", "风险调整 (Risk-Adjusted)", "趋势质量 (Efficiency Ratio)", "量价爆发 (PV Breakout)"]
+            if 'sat_score_mode' in st.session_state.params and st.session_state.params['sat_score_mode'] in s_modes_list:
+                s_mode_idx = s_modes_list.index(st.session_state.params['sat_score_mode'])
             
-            s_mode = st.selectbox("卫星算法", ["纯收益 (Return)", "风险调整 (Risk-Adjusted)", "趋势质量 (Efficiency Ratio)"], index=s_mode_default_idx, key='s_mode')
-            s_lookback = st.slider("卫星-周期", 3, 30, st.session_state.params.get('sat_lookback', 15))
+            s_mode = st.selectbox("卫星算法", s_modes_list, index=s_mode_idx, key='s_mode')
+            s_lookback = st.slider("卫星-周期 (建议3-5)", 2, 20, st.session_state.params.get('sat_lookback', 5))
             s_smooth = st.slider("卫星-平滑", 1, 5, st.session_state.params.get('sat_smooth', 1))
             s_topn = st.slider("卫星-持仓", 1, 5, st.session_state.params.get('sat_top_n', 2))
             s_cash = st.checkbox("卫星-避险", st.session_state.params.get('sat_allow_cash', False))
@@ -358,10 +394,8 @@ def main():
     # --- 主界面 ---
     st.title("AlphaTarget v6 | 核心卫星双驱策略")
     
-    if not sel_core_codes or not sel_sat_concepts:
-        st.warning("请配置完整的资产池。"); st.stop()
+    if not sel_core_codes or not sel_sat_concepts: st.warning("请配置资产池"); st.stop()
 
-    # 1. 下载 (时间范围现在使用 start_str='20150101' 以支持更长回测)
     t_date = datetime.now()
     if t_date.hour < 15: t_date -= timedelta(days=1)
     end_str = t_date.strftime('%Y%m%d')
@@ -369,29 +403,27 @@ def main():
     c1, c2 = st.columns(2)
     with c1:
         with st.spinner("同步核心数据..."):
-            core_data, core_map = download_etf_data(sel_core_codes, end_str)
+            core_data, core_vol, core_map = download_etf_data(sel_core_codes, end_str)
     with c2:
-        sat_data, sat_map = download_concept_data(sel_sat_concepts, end_str)
+        sat_data, sat_vol, sat_map = download_concept_data(sel_sat_concepts, end_str)
         
     if core_data is None or sat_data is None: st.error("数据获取失败"); st.stop()
         
-    # 对齐
     common_idx = core_data.index.intersection(sat_data.index)
-    # 应用侧边栏的时间过滤
     mask = (common_idx >= start_d) & (common_idx <= end_d)
     common_idx = common_idx[mask]
     
-    if len(common_idx) < 20: st.error(f"选定区间 ({start_d.date()} - {end_d.date()}) 数据不足"); st.stop()
+    if len(common_idx) < 20: st.error(f"数据不足"); st.stop()
     
-    core_data = core_data.loc[common_idx]
-    sat_data = sat_data.loc[common_idx]
+    core_data, core_vol = core_data.loc[common_idx], core_vol.loc[common_idx]
+    sat_data, sat_vol = sat_data.loc[common_idx], sat_vol.loc[common_idx]
     
     # 2. 回测
     p_core = {'lookback': c_lookback, 'smooth': c_smooth, 'top_n': c_topn, 'score_mode': c_mode, 'allow_cash': c_cash}
-    core_eq, core_tr, core_hist, core_dret = run_strategy(core_data, p_core)
+    core_eq, core_tr, core_hist, core_dret = run_strategy(core_data, core_vol, p_core)
     
     p_sat = {'lookback': s_lookback, 'smooth': s_smooth, 'top_n': s_topn, 'score_mode': s_mode, 'allow_cash': s_cash}
-    sat_eq, sat_tr, sat_hist, sat_dret = run_strategy(sat_data, p_sat)
+    sat_eq, sat_tr, sat_hist, sat_dret = run_strategy(sat_data, sat_vol, p_sat)
     
     # 3. 组合
     combo_dret = core_weight * core_dret + (1-core_weight) * sat_dret
@@ -406,12 +438,11 @@ def main():
     cols = st.columns(4)
     with cols[0]: st.markdown(metric_html("组合年化收益", f"{m_combo['CAGR']:.1%}", "#d62728"), unsafe_allow_html=True)
     with cols[1]: st.markdown(metric_html("组合最大回撤", f"{m_combo['MaxDD']:.1%}", "green"), unsafe_allow_html=True)
-    with cols[2]: st.markdown(metric_html("组合夏普比率", f"{m_combo['Sharpe']:.2f}", "#333"), unsafe_allow_html=True)
-    with cols[3]: st.markdown(metric_html("卫星策略收益", f"{m_sat['CAGR']:.1%}", "#d62728"), unsafe_allow_html=True)
+    with cols[2]: st.markdown(metric_html("卫星年化 (Sat)", f"{m_sat['CAGR']:.1%}", "#d62728"), unsafe_allow_html=True)
+    with cols[3]: st.markdown(metric_html("卫星夏普", f"{m_sat['Sharpe']:.2f}", "#333"), unsafe_allow_html=True)
     
     st.write("")
     
-    # 详细对比图
     tab1, tab2, tab3 = st.tabs(["📈 净值透视", "🗂️ 持仓历史", "🔬 归因分析"])
     
     with tab1:
@@ -424,7 +455,6 @@ def main():
         
     with tab2:
         st.markdown("**📅 历史持仓日历 (Holdings Log)**")
-        # 构建持仓展示 DataFrame
         def fmt_holdings(hist, map_d, cols):
             res = []
             for h_idxs in hist:
@@ -438,9 +468,6 @@ def main():
         df_hold = pd.DataFrame(index=common_idx)
         df_hold['🔵 核心持仓'] = fmt_holdings(core_hist, core_map, core_data.columns)
         df_hold['🔴 卫星持仓'] = fmt_holdings(sat_hist, sat_map, sat_data.columns)
-        df_hold['总净值'] = combo_eq
-        
-        # 倒序显示，只显示最近的
         st.dataframe(df_hold.sort_index(ascending=False), use_container_width=True, height=500)
             
     with tab3:
