@@ -3,316 +3,449 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import plotly.express as px
 from datetime import datetime, timedelta
 import time
+import json
+import os
+
+# 安全导入 scipy
+try:
+    from scipy import stats
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# ==========================================
+# 0. 配置与常量
+# ==========================================
+CONFIG_FILE = 'strategy_config_v5.json'
+
+DEFAULT_CORE_CODES = ["518880", "513100", "588000", "512890"]
+PRESET_ETFS = {
+    "518880": "黄金ETF (避险锚)",
+    "513100": "纳指100 (美股科技)",
+    "588000": "科创50 (A股进攻)",
+    "512890": "红利低波 (A股防守)",
+    "511090": "30年国债 (债牛对冲)",
+    "513520": "日经ETF (日本市场)",
+    "510300": "沪深300 (核心资产)",
+    "159915": "创业板指 (成长旧王)"
+}
+
+# 增加更多热门概念，并做好名称适配
+PRESET_CONCEPTS = [
+    "机器人概念", "商业航天概念", "脑机接口", "低空经济", 
+    "算力概念", "CPO概念", "人工智能", "半导体", 
+    "量子科技", "6G概念", "固态电池", "数据要素",
+    "车路云", "人形机器人", "信创", "创新药"
+]
+DEFAULT_SATELLITE_CONCEPTS = ["机器人概念", "商业航天概念", "脑机接口", "低空经济", "算力概念"]
+
+DEFAULT_PARAMS = {
+    'invest_ratio': 0.8,
+    'core_codes': DEFAULT_CORE_CODES,
+    'core_lookback': 25, 'core_smooth': 3, 'core_top_n': 1, 'core_allow_cash': True,
+    'sat_concepts': DEFAULT_SATELLITE_CONCEPTS,
+    'sat_lookback': 10, 'sat_smooth': 2, 'sat_top_n': 2, 'sat_allow_cash': False,
+    'score_mode': '纯收益 (Return)'
+}
+
+TRANSACTION_COST = 0.0001 
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                saved = json.load(f)
+                config = DEFAULT_PARAMS.copy()
+                config.update(saved)
+                return config
+        except: return DEFAULT_PARAMS.copy()
+    return DEFAULT_PARAMS.copy()
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f)
+    except: pass
 
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(
-    page_title="核心资产轮动策略看板",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="AlphaTarget v5 | 双核驱动量化系统", page_icon="🛰️", layout="wide")
 
-# 标的池配置 (固定不变)
-ASSETS = {
-    '510180': {'name': '上证180 (价值)', 'color': '#1f77b4'},
-    '159915': {'name': '创业板指 (成长)', 'color': '#2ca02c'},
-    '513100': {'name': '纳指100 (海外)', 'color': '#9467bd'},
-    '518880': {'name': '黄金ETF (避险)', 'color': '#ff7f0e'}
-}
+st.markdown("""
+<style>
+    .stApp {background-color: #f8f9fa; font-family: 'Roboto', sans-serif;}
+    .metric-card {background-color: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; text-align: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);}
+    .metric-label {color: #666; font-size: 0.85rem; text-transform: uppercase;}
+    .metric-value {color: #333; font-size: 1.5rem; font-weight: 700;}
+</style>
+""", unsafe_allow_html=True)
 
 # ==========================================
-# 2. 数据获取与缓存
+# 2. 健壮数据层 (Robust Data Layer)
 # ==========================================
-@st.cache_data(ttl=3600*12)
-def load_data():
-    """下载全量数据"""
+@st.cache_data(ttl=3600*12) 
+def get_etf_list():
+    try: return ak.fund_etf_spot_em()
+    except: return pd.DataFrame()
+
+@st.cache_data(ttl=3600*4)
+def download_etf_data(codes, end_date_str):
+    start_str = '20190101'
     price_dict = {}
-    # 下载足够早的数据以确保2014年初始动量可计算
-    start_str = '20130101'
-    end_str = datetime.now().strftime('%Y%m%d')
+    name_map = {}
+    etf_list = get_etf_list()
     
-    # 进度提示
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    idx = 0
-    for code, info in ASSETS.items():
-        name = info['name']
-        status_text.text(f"正在下载: {name}...")
+    for code in codes:
+        name = code
+        if code in PRESET_ETFS: name = PRESET_ETFS[code].split(" ")[0]
+        elif not etf_list.empty:
+            m = etf_list[etf_list['代码'] == code]
+            if not m.empty: name = m.iloc[0]['名称']
+        name_map[code] = name
+        
         try:
-            # 使用前复权 (qfq) 保证收益率真实性
-            df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_str, end_date=end_str, adjust="qfq")
-            df['日期'] = pd.to_datetime(df['日期'])
-            df.set_index('日期', inplace=True)
-            price_dict[name] = df['收盘'].astype(float)
-        except Exception as e:
-            st.error(f"{name} 下载失败: {e}")
-        
-        idx += 1
-        progress_bar.progress(idx / len(ASSETS))
+            df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_str, end_date=end_date_str, adjust="qfq")
+            if not df.empty:
+                df.index = pd.to_datetime(df['日期'])
+                price_dict[name] = df['收盘'].astype(float)
+        except: continue
+
+    if not price_dict: return None, None
+    data = pd.concat(price_dict, axis=1).sort_index().ffill()
+    # 核心资产通常数据较好，直接dropna
+    data.dropna(how='all', inplace=True)
+    return (data, name_map) if len(data) >= 20 else (None, None)
+
+@st.cache_data(ttl=3600*4)
+def download_concept_data(concepts, end_date_str):
+    """
+    下载概念数据 (增强容错版)
+    """
+    start_str = '20190101'
+    price_dict = {}
+    name_map = {}
     
-    status_text.text("数据清洗中...")
-    # 对齐数据，前向填充处理停牌
-    data = pd.concat(price_dict, axis=1).sort_index().ffill().dropna()
+    progress_bar = st.progress(0, text="启动卫星雷达，扫描行业数据...")
+    total = len(concepts)
+    success_count = 0
     
+    for i, concept_name in enumerate(concepts):
+        try:
+            # 尝试下载
+            df = ak.stock_board_concept_hist_em(symbol=concept_name, period="daily", start_date=start_str, end_date=end_date_str, adjust="qfq")
+            if not df.empty:
+                df.index = pd.to_datetime(df['日期'])
+                price_dict[concept_name] = df['收盘'].astype(float)
+                name_map[concept_name] = concept_name
+                success_count += 1
+        except Exception:
+            # 某些概念可能改名或下线，静默失败，不中断程序
+            pass
+        finally:
+            progress_bar.progress((i + 1) / total)
+            
     progress_bar.empty()
-    status_text.empty()
+
+    if not price_dict: return None, None
     
-    return data
-
-def calculate_slope(series):
-    """辅助函数：计算线性回归斜率 (简化版，用于rolling apply)"""
-    # x是时间序列 0, 1, 2... n
-    y = np.log(series) # 使用对数价格，计算出的斜率近似于指数增长率
-    n = len(y)
-    x = np.arange(n)
-    # 线性回归斜率公式: (n*Sum(xy) - Sum(x)*Sum(y)) / (n*Sum(x^2) - (Sum(x))^2)
-    # 为了速度，直接使用 numpy 的 polyfit
-    try:
-        slope, _ = np.polyfit(x, y, 1)
-        return slope
-    except:
-        return 0.0
-
-def calculate_indicators(data, lookback, smooth_window, method):
-    """
-    根据参数动态计算指标
-    :param method: "普通动量 (ROC)", "夏普动量 (Sharpe)", "回归动量 (Slope)"
-    """
-    # 1. 每日收益率
-    daily_returns = data.pct_change().fillna(0)
+    # 概念板块上线时间不一，不能简单 dropna(how='any')，否则会因为一个新概念把所有历史数据切掉
+    # 策略：取并集，空值向后填充，仍然空的填0或处理为不交易
+    data = pd.concat(price_dict, axis=1).sort_index().ffill()
     
-    raw_mom = pd.DataFrame()
-
-    # --- 核心动量算法分支 ---
-    if method == "普通动量 (ROC)":
-        # 经典算法: Pt / Pt-n - 1
-        raw_mom = data.pct_change(lookback)
+    # 再次清洗：如果某列数据太少(<20天)，剔除该列，防止计算动量报错
+    cols_to_drop = [c for c in data.columns if data[c].count() < 20]
+    if cols_to_drop:
+        data.drop(columns=cols_to_drop, inplace=True)
+        # st.toast(f"已剔除数据过短的概念: {','.join(cols_to_drop)}", icon="⚠️")
         
-    elif method == "夏普动量 (Sharpe)":
-        # 科学算法1: 风险调整后收益
-        # 计算窗口期内的平均日收益率 / 收益率标准差
-        # 乘以 sqrt(252) 年化，虽然比较时可以约掉，但保留年化习惯更好
-        window_mean = daily_returns.rolling(lookback).mean()
-        window_std = daily_returns.rolling(lookback).std()
-        # 避免除以0
-        raw_mom = (window_mean / (window_std + 1e-9)) * np.sqrt(252)
-        
-    elif method == "回归动量 (Slope)":
-        # 科学算法2: 线性回归斜率 (抗噪音能力最强)
-        # 计算 log(price) 对 time 的回归斜率
-        # rolling apply 速度稍慢，但对于几千行数据是可以接受的
-        raw_mom = data.rolling(lookback).apply(calculate_slope, raw=True)
+    return data, name_map
 
-    # 3. 动量平滑 (如果 smooth_window=1 则相当于不平滑)
-    if smooth_window > 1:
-        signal_mom = raw_mom.rolling(smooth_window).mean()
+# ==========================================
+# 3. 策略引擎
+# ==========================================
+def calculate_score(data, lookback, smooth, mode):
+    ret = data.pct_change(lookback)
+    if mode == '风险调整 (Risk-Adjusted)':
+        vol = data.pct_change().rolling(lookback).std() * np.sqrt(lookback)
+        score = ret / (vol + 0.0001)
     else:
-        signal_mom = raw_mom
-        
-    # 4. 信号偏移: T日的持仓只能基于T-1日的收盘数据
-    signal_mom_shifted = signal_mom.shift(1)
-    
-    return daily_returns, signal_mom_shifted
+        score = ret
+    if smooth > 1: score = score.rolling(smooth).mean()
+    return score
 
-# ==========================================
-# 3. 回测引擎
-# ==========================================
-def run_backtest(start_date, end_date, initial_capital, daily_returns, signal_mom, threshold):
-    # 截取时间段
-    mask = (daily_returns.index >= pd.to_datetime(start_date)) & (daily_returns.index <= pd.to_datetime(end_date))
-    period_ret = daily_returns.loc[mask]
-    period_mom = signal_mom.loc[mask]
+def run_strategy(data, params):
+    # 解包
+    lookback = params['lookback']
+    smooth = params['smooth']
+    threshold = 0.005 
+    top_n = params['top_n']
+    mode = params['score_mode']
+    allow_cash = params['allow_cash']
     
-    if period_ret.empty:
-        return None, 0
-
-    dates = period_ret.index
-    capital = initial_capital
-    curve = []
-    holdings = []
-    mom_scores = [] 
+    daily_ret = data.pct_change().fillna(0)
+    score_df = calculate_score(data, lookback, smooth, mode)
     
-    current_holding = None
+    p_score = score_df.shift(1).values
+    p_ret = daily_ret.values
+    n_days, n_assets = daily_ret.shape
+    
+    strategy_ret = np.zeros(n_days)
+    current_holdings = [-1] * top_n 
     trade_count = 0
+    holdings_hist = []
     
-    for date in dates:
-        row = period_mom.loc[date]
+    for i in range(n_days):
+        row_score = p_score[i]
         
-        # 选出最高分
-        best_asset = row.idxmax()
-        best_score = row.max()
+        # 针对概念数据，可能某些列是NaN（未上市），不能all()判断
+        # 处理：如果是NaN，给一个极小值
+        clean_score = np.nan_to_num(row_score, nan=-np.inf)
         
-        target = current_holding
+        # 如果整行都是-inf（当天所有标的都没数据），跳过
+        if np.isneginf(clean_score).all():
+            holdings_hist.append([-1]*top_n)
+            continue
         
-        # 决策逻辑
-        if pd.isna(best_asset) or pd.isna(best_score):
-            pass 
-        else:
-            if current_holding is None:
-                target = best_asset
-            elif current_holding not in row.index:
-                target = best_asset
-            else:
-                curr_score = row[current_holding]
-                if best_asset != current_holding:
-                    # 阈值判定
-                    if best_score > curr_score + threshold:
-                        target = best_asset
-                    else:
-                        target = current_holding
+        # 避险
+        if allow_cash:
+            for k in range(top_n):
+                if current_holdings[k] != -1:
+                    # 检查持有标的是否还在交易(非NaN/Inf)
+                    s = clean_score[current_holdings[k]]
+                    if s < 0 or s == -np.inf:
+                        current_holdings[k] = -1
         
-        if target != current_holding and target is not None:
-            trade_count += 1
+        # 候选
+        curr_set = set(current_holdings)
+        candidates = []
+        for idx in np.argsort(clean_score)[::-1]:
+            if idx not in curr_set:
+                if clean_score[idx] == -np.inf: continue # 过滤无效数据
+                if (not allow_cash) or (clean_score[idx] > 0):
+                    candidates.append(idx)
+        
+        # 换仓
+        made_swap = True
+        while made_swap and candidates:
+            made_swap = False
+            worst_h_idx = -1
+            min_score = np.inf
+            worst_pos = -1
             
-        current_holding = target
-        
-        if current_holding:
-            r = period_ret.loc[date, current_holding]
-            capital = capital * (1 + r)
-            holdings.append(current_holding)
-            mom_scores.append(row[current_holding])
-        else:
-            holdings.append('准备期')
-            mom_scores.append(0)
+            for k, h_idx in enumerate(current_holdings):
+                s = 0.0 if h_idx == -1 else clean_score[h_idx]
+                if s < min_score:
+                    min_score = s
+                    worst_h_idx = h_idx
+                    worst_pos = k
             
-        curve.append(capital)
+            best_c_idx = candidates[0]
+            if clean_score[best_c_idx] > min_score + threshold:
+                cost = TRANSACTION_COST if worst_h_idx == -1 else TRANSACTION_COST * 2
+                strategy_ret[i] -= cost / top_n
+                trade_count += 1
+                current_holdings[worst_pos] = best_c_idx
+                candidates.pop(0)
+                made_swap = True
+                
+        # 收益
+        day_ret = 0.0
+        active_pos = 0
+        for h_idx in current_holdings:
+            if h_idx != -1: 
+                day_ret += p_ret[i, h_idx]
+                active_pos += 1
         
-    res_df = pd.DataFrame({
-        '总资产': curve,
-        '持仓': holdings,
-        '持仓动量分': mom_scores
-    }, index=dates)
-    
-    mom_display = period_mom.copy()
-    mom_display.columns = [f"{c}_分" for c in mom_display.columns]
-    res_df = pd.concat([res_df, mom_display], axis=1)
-    
-    return res_df, trade_count
+        # 资金利用率修正：如果是 Top N 模型，空仓部分不产生收益
+        strategy_ret[i] += day_ret / top_n
+        holdings_hist.append(list(current_holdings))
+        
+    equity_curve = (1 + strategy_ret).cumprod()
+    return equity_curve, trade_count, holdings_hist, strategy_ret
+
+def calc_metrics(equity):
+    if len(equity) < 2: return {}
+    total = equity[-1] - 1
+    days = len(equity)
+    ann_ret = (1 + total) ** (252/days) - 1
+    daily_ret = pd.Series(equity).pct_change().fillna(0)
+    vol = daily_ret.std() * np.sqrt(252)
+    dd = (equity - np.maximum.accumulate(equity)) / np.maximum.accumulate(equity)
+    max_dd = dd.min()
+    sharpe = (ann_ret - 0.03) / (vol + 1e-9)
+    return {"CAGR": ann_ret, "MaxDD": max_dd, "Sharpe": sharpe, "Vol": vol}
+
+def metric_html(label, value, color="#333"):
+    return f"""<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value" style="color:{color}">{value}</div></div>"""
 
 # ==========================================
-# 4. 主界面逻辑
+# 5. 主程序 UI
 # ==========================================
 def main():
+    if 'params' not in st.session_state:
+        st.session_state.params = load_config()
+    
     with st.sidebar:
-        st.header("⚙️ 策略控制台")
+        st.title("🛰️ 核心-卫星策略台")
         
-        # 1. 动量模型选择 (本次更新核心)
-        mom_method = st.selectbox(
-            "动量计算模型 (Algorithm)",
-            ["普通动量 (ROC)", "夏普动量 (Sharpe)", "回归动量 (Slope)"],
-            index=0,
-            help="""
-            - 普通动量: 简单计算 (P_t / P_t-n) - 1。对噪音敏感。
-            - 夏普动量: 收益率 / 波动率。优先选择涨得稳的标的 (风险调整)。
-            - 回归动量: 计算价格走势的线性斜率。利用了期间所有数据，抗干扰最强。
-            """
-        )
-
-        st.divider()
-        
-        # 2. 模式与参数
-        mode = st.radio(
-            "回测模式",
-            ("PPT严格复刻", "自定义稳健"),
-            index=0
-        )
-        
-        if mode == "PPT严格复刻":
-            lookback = 25
-            smooth = 1
-            threshold = 0.0
-            st.caption("🔒 参数已锁定: 25日周期 / 无平滑 / 无阈值")
-        else:
-            lookback = st.number_input("动量周期 (日)", value=25)
-            smooth = st.number_input("平滑窗口 (日)", value=3)
-            threshold = st.number_input("换仓阈值", value=0.005, step=0.001, format="%.3f")
+        st.markdown("### 1. 顶层资产配置")
+        core_weight = st.slider("核心策略权重 (Core Weight)", 0.0, 1.0, st.session_state.params.get('invest_ratio', 0.8), 0.1)
+        st.caption(f"🔵 核心(宽基): {core_weight:.0%} | 🔴 卫星(行业): {1-core_weight:.0%}")
         
         st.divider()
-        init_cash = st.number_input("初始本金", value=500000, step=10000)
         
-        # 日期选择
-        data = load_data()
-        min_date = data.index[0].date()
-        max_date = data.index[-1].date()
-        default_start = datetime(2014, 1, 1).date()
+        tab_core, tab_sat = st.tabs(["🔵 核心 (ETF)", "🔴 卫星 (概念)"])
         
-        col1, col2 = st.columns(2)
-        start_date = col1.date_input("开始", value=default_start, min_value=min_date, max_value=max_date)
-        end_date = col2.date_input("结束", value=max_date, min_value=min_date, max_value=max_date)
+        with tab_core:
+            all_etfs = get_etf_list()
+            pre_opts = [f"{k} | {v}" for k,v in PRESET_ETFS.items()]
+            curr_core = st.session_state.params.get('core_codes', DEFAULT_CORE_CODES)
+            sel_core_disp = st.multiselect("核心池", pre_opts, default=[x for x in pre_opts if x.split(" | ")[0] in curr_core])
+            sel_core_codes = [x.split(" | ")[0] for x in sel_core_disp]
+            
+            c_lookback = st.slider("核心-周期", 5, 60, st.session_state.params.get('core_lookback', 25))
+            c_smooth = st.slider("核心-平滑", 1, 10, st.session_state.params.get('core_smooth', 3))
+            c_topn = st.slider("核心-持仓", 1, 3, st.session_state.params.get('core_top_n', 1))
+            c_cash = st.checkbox("核心-避险", st.session_state.params.get('core_allow_cash', True))
+            
+        with tab_sat:
+            curr_sat = st.session_state.params.get('sat_concepts', DEFAULT_SATELLITE_CONCEPTS)
+            sel_sat_concepts = st.multiselect("卫星池 (Concept)", PRESET_CONCEPTS, default=curr_sat)
+            
+            st.info("💡 建议：卫星策略应使用更短周期，更灵敏地捕捉热点。")
+            s_lookback = st.slider("卫星-周期", 3, 30, st.session_state.params.get('sat_lookback', 10))
+            s_smooth = st.slider("卫星-平滑", 1, 5, st.session_state.params.get('sat_smooth', 2))
+            s_topn = st.slider("卫星-持仓", 1, 5, st.session_state.params.get('sat_top_n', 2))
+            s_cash = st.checkbox("卫星-避险", st.session_state.params.get('sat_allow_cash', False))
 
-    # --- 主区域 ---
-    st.title("📊 核心资产轮动策略看板 (Pro)")
-    
-    # 动态显示当前算法原理
-    with st.expander(f"📖 当前算法详解: {mom_method}", expanded=True):
-        if mom_method == "普通动量 (ROC)":
-            st.markdown(r"$$ \text{Score} = \frac{P_t}{P_{t-25}} - 1 $$")
-            st.info("最原始的算法。优点是反应快，缺点是如果25天前正好是个低点，今天的动量会虚高（基数效应）。")
-        elif mom_method == "夏普动量 (Sharpe)":
-            st.markdown(r"$$ \text{Score} = \frac{\text{Mean}(R)}{\text{Std}(R)} \times \sqrt{252} $$")
-            st.info("最科学的算法。它惩罚波动率。如果纳指和黄金都涨了10%，但黄金走势更平稳，系统会认为黄金的动量更强。适合追求稳健收益。")
-        elif mom_method == "回归动量 (Slope)":
-            st.markdown(r"$$ \ln(P_t) = \alpha + \beta \cdot t + \epsilon \quad (\text{Score} = \beta) $$")
-            st.info("最稳健的算法。它对过去25天的价格取对数后拟合一条直线，直线的斜率代表平均增长速度。它使用了期间所有数据点，极难被单日暴涨暴跌干扰。")
+        st.divider()
+        if st.button("🚀 运行双核回测 (Run)"):
+            new_conf = st.session_state.params.copy()
+            new_conf.update({
+                'invest_ratio': core_weight,
+                'core_codes': sel_core_codes, 'core_lookback': c_lookback, 'core_smooth': c_smooth, 'core_top_n': c_topn, 'core_allow_cash': c_cash,
+                'sat_concepts': sel_sat_concepts, 'sat_lookback': s_lookback, 'sat_smooth': s_smooth, 'sat_top_n': s_topn, 'sat_allow_cash': s_cash
+            })
+            st.session_state.params = new_conf
+            save_config(new_conf)
+            st.rerun()
 
-    # 计算指标
-    daily_returns, signal_mom = calculate_indicators(data, lookback, smooth, mom_method)
+    # --- 主界面 ---
+    st.title("AlphaTarget v5 | 核心卫星双驱策略")
     
-    # 运行回测
-    df_res, trade_count = run_backtest(start_date, end_date, init_cash, daily_returns, signal_mom, threshold)
+    if not sel_core_codes or not sel_sat_concepts:
+        st.warning("请配置完整的资产池。"); st.stop()
+
+    # 1. 下载
+    t_date = datetime.now()
+    if t_date.hour < 15: t_date -= timedelta(days=1)
+    end_str = t_date.strftime('%Y%m%d')
     
-    if df_res is None:
-        st.error("无数据")
-        st.stop()
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.spinner("同步核心数据..."):
+            core_data, core_map = download_etf_data(sel_core_codes, end_str)
+    with c2:
+        # 卫星数据下载较慢，Spinner文案区分
+        sat_data, sat_map = download_concept_data(sel_sat_concepts, end_str)
         
-    # --- 结果展示 ---
-    final_val = df_res['总资产'].iloc[-1]
-    total_ret = (final_val / init_cash) - 1
-    days = (df_res.index[-1] - df_res.index[0]).days
-    annual_ret = (final_val / init_cash) ** (365.25/days) - 1 if days > 0 else 0
-    avg_days = days / trade_count if trade_count > 0 else days
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("区间收益率", f"{total_ret*100:.2f}%", f"期末: {final_val:,.0f}")
-    c2.metric("年化收益率", f"{annual_ret*100:.2f}%")
-    c3.metric("调仓次数", f"{trade_count} 次", f"平均 {avg_days:.1f} 天/换")
-    
-    # 图表
-    st.subheader("📈 资金曲线")
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.85, 0.15])
-    
-    fig.add_trace(go.Scatter(x=df_res.index, y=df_res['总资产'], mode='lines', name='策略净值', line=dict(color='#d62728', width=2)), row=1, col=1)
-    
-    for code, info in ASSETS.items():
-        name = info['name']
-        bench = (1 + daily_returns.loc[df_res.index, name]).cumprod()
-        bench = bench / bench.iloc[0] * init_cash
-        fig.add_trace(go.Scatter(x=df_res.index, y=bench, name=name, line=dict(width=1, dash='dot'), opacity=0.3), row=1, col=1)
-
-    # 色带
-    df_res['group'] = (df_res['持仓'] != df_res['持仓'].shift()).cumsum()
-    groups = df_res.reset_index().groupby('group').agg({'日期': ['first', 'last'], '持仓': 'first'})
-    groups.columns = ['start', 'end', 'asset']
-    
-    for _, row in groups.iterrows():
-        asset = row['asset']
-        color = 'gray'
-        for _, info in ASSETS.items():
-            if info['name'] == asset: color = info['color']
+    if core_data is None or sat_data is None:
+        st.error("数据获取失败，请检查网络或减少概念数量。"); st.stop()
         
-        fig.add_trace(go.Scatter(x=[row['start'], row['end']], y=[1, 1], mode='lines', line=dict(color=color, width=15), name=asset, showlegend=False, hovertemplate=f"持仓: {asset}<extra></extra>"), row=2, col=1)
-
-    fig.update_layout(height=500, hovermode="x unified", yaxis=dict(title='总资产'), yaxis2=dict(showticklabels=False))
-    st.plotly_chart(fig, use_container_width=True)
+    # 对齐
+    common_idx = core_data.index.intersection(sat_data.index)
+    if len(common_idx) < 50: st.error("数据重叠区间过短"); st.stop()
+    core_data = core_data.loc[common_idx]
+    sat_data = sat_data.loc[common_idx]
     
-    # 详细数据
-    with st.expander("📋 每日详细数据 (含动量分)"):
-        st.dataframe(df_res.sort_index(ascending=False).style.format({'总资产': '{:,.2f}'}), use_container_width=True)
+    # 2. 回测
+    p_core = {'lookback': c_lookback, 'smooth': c_smooth, 'top_n': c_topn, 'score_mode': '纯收益 (Return)', 'allow_cash': c_cash}
+    core_eq, core_tr, core_hist, core_dret = run_strategy(core_data, p_core)
+    
+    p_sat = {'lookback': s_lookback, 'smooth': s_smooth, 'top_n': s_topn, 'score_mode': '纯收益 (Return)', 'allow_cash': s_cash}
+    sat_eq, sat_tr, sat_hist, sat_dret = run_strategy(sat_data, p_sat)
+    
+    # 3. 组合
+    combo_dret = core_weight * core_dret + (1-core_weight) * sat_dret
+    combo_eq = (1 + combo_dret).cumprod()
+    
+    # 4. 报表
+    m_combo = calc_metrics(combo_eq)
+    m_core = calc_metrics(core_eq)
+    m_sat = calc_metrics(sat_eq)
+    
+    st.markdown("### 📊 组合总览 (Portfolio)")
+    cols = st.columns(4)
+    with cols[0]: st.markdown(metric_html("组合年化收益", f"{m_combo['CAGR']:.1%}", "#d62728"), unsafe_allow_html=True)
+    with cols[1]: st.markdown(metric_html("组合最大回撤", f"{m_combo['MaxDD']:.1%}", "green"), unsafe_allow_html=True)
+    with cols[2]: st.markdown(metric_html("组合夏普比率", f"{m_combo['Sharpe']:.2f}", "#333"), unsafe_allow_html=True)
+    with cols[3]: st.markdown(metric_html("波动率 (Vol)", f"{m_combo['Vol']:.1%}", "#333"), unsafe_allow_html=True)
+    
+    st.write("")
+    
+    # 详细对比图
+    tab1, tab2, tab3 = st.tabs(["📈 净值与相关性", "📝 实时信号", "🔬 归因分析"])
+    
+    with tab1:
+        # 净值图
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=common_idx, y=combo_eq, name="总组合 (Combined)", line=dict(color='#1e3c72', width=3)))
+        fig.add_trace(go.Scatter(x=common_idx, y=core_eq, name=f"核心 (Core, {core_weight:.0%})", line=dict(color='#63b2ee', width=1)))
+        fig.add_trace(go.Scatter(x=common_idx, y=sat_eq, name=f"卫星 (Sat, {1-core_weight:.0%})", line=dict(color='#d62728', width=1)))
+        fig.update_layout(height=400, hovermode="x unified", margin=dict(l=0,r=0,t=0,b=0), legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 滚动相关性图 (投行级分析)
+        st.markdown("**🔗 核心-卫星 滚动相关性 (60日窗口)**")
+        st.caption("观察：当相关性(Correlation) < 0 时，说明卫星资产有效地对冲了核心资产的风险。")
+        s_corr = pd.Series(core_dret).rolling(60).corr(pd.Series(sat_dret)).dropna()
+        fig_corr = px.area(x=common_idx[-len(s_corr):], y=s_corr, labels={'x':'Date', 'y':'Correlation'})
+        fig_corr.update_traces(line_color='#666', fill_color='rgba(100,100,100,0.2)')
+        fig_corr.update_yaxes(range=[-1, 1])
+        fig_corr.add_hline(y=0, line_dash="dash", line_color="red")
+        fig_corr.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0))
+        st.plotly_chart(fig_corr, use_container_width=True)
+        
+    with tab2:
+        # 信号解析
+        def get_names(hist_list, map_dict, cols):
+            idxs = hist_list[-1]
+            names = []
+            for idx in idxs:
+                if idx == -1: names.append("Cash")
+                else: names.append(map_dict.get(cols[idx], cols[idx]))
+            return names
+            
+        c_hold = get_names(core_hist, core_map, core_data.columns)
+        s_hold = get_names(sat_hist, sat_map, sat_data.columns)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.info(f"🔵 核心持仓 (Top {c_topn})")
+            for n in c_hold: st.write(f"• **{n}**")
+        with c2:
+            st.error(f"🔴 卫星持仓 (Top {s_topn})")
+            for n in s_hold: st.write(f"• **{n}**")
+            
+    with tab3:
+        # 贡献度表格
+        attr_data = {
+            "策略": ["核心 (Core)", "卫星 (Satellite)"],
+            "年化收益": [m_core['CAGR'], m_sat['CAGR']],
+            "最大回撤": [m_core['MaxDD'], m_sat['MaxDD']],
+            "波动率": [m_core['Vol'], m_sat['Vol']],
+            "夏普比": [m_core['Sharpe'], m_sat['Sharpe']],
+            "交易次数": [core_tr, sat_tr]
+        }
+        df_attr = pd.DataFrame(attr_data).set_index("策略")
+        st.markdown("#### 风险收益归因 (Attribution)")
+        st.dataframe(df_attr.style.format({
+            "年化收益": "{:.1%}", "最大回撤": "{:.1%}", "波动率": "{:.1%}", "夏普比": "{:.2f}"
+        }), use_container_width=True)
 
 if __name__ == "__main__":
     main()
