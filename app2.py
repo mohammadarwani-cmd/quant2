@@ -404,7 +404,7 @@ def main():
         st.caption("观察：当相关性(Correlation) < 0 时，说明卫星资产有效地对冲了核心资产的风险。")
         s_corr = pd.Series(core_dret).rolling(60).corr(pd.Series(sat_dret)).dropna()
         fig_corr = px.area(x=common_idx[-len(s_corr):], y=s_corr, labels={'x':'Date', 'y':'Correlation'})
-        fig_corr.update_traces(line_color='#666', fill_color='rgba(100,100,100,0.2)')
+        fig_corr.update_traces(line_color='#666', fillcolor='rgba(100,100,100,0.2)')
         fig_corr.update_yaxes(range=[-1, 1])
         fig_corr.add_hline(y=0, line_dash="dash", line_color="red")
         fig_corr.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0))
